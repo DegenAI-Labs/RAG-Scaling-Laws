@@ -1,0 +1,3 @@
+[submodule "RAG-evaluation-harnesses"]
+	path = RAG-evaluation-harnesses
+	url = https://github.com/DegenAI-Labs/RAG-evaluation-harnesses.git
