@@ -1,3 +1,6 @@
 [submodule "RAG-evaluation-harnesses"]
-	path = RAG-evaluation-harnesses
+	path = external/RAG-evaluation-harnesses
 	url = https://github.com/DegenAI-Labs/RAG-evaluation-harnesses.git
+[submodule "external/litgpt"]
+	path = external/litgpt
+	url = https://github.com/DegenAI-Labs/litgpt
