@@ -3,8 +3,10 @@ import argparse
 import concurrent.futures
 import gc
 import glob
+import hashlib
 import json
 import os
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -12,6 +14,8 @@ import faiss
 import numpy as np
 import tiktoken
 import yaml
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 def format_time(seconds: float) -> str:
@@ -317,6 +321,90 @@ def compute_global_token_counts(
     return counts
 
 
+def normalized_text_for_dedupe(text: str) -> str:
+    # Conservative normalization for exact-ish duplicate removal.
+    return " ".join(text.lower().split())
+
+
+def build_filtered_candidate_indices(parts: List[dict], token_counts: np.ndarray, args):
+    """Optional store cleanup: quality filters + exact-text dedupe.
+
+    Returns:
+        candidate_indices: np.ndarray of global row ids kept for subsampling/indexing.
+        stats: dict with keep/drop counters.
+    """
+    n_total = len(token_counts)
+    keep_mask = np.zeros((n_total,), dtype=np.bool_)
+    seen_hashes = set() if args.dedupe_exact_text else None
+
+    stats = {
+        "enabled": True,
+        "dedupe_exact_text": bool(args.dedupe_exact_text),
+        "min_chunk_tokens": int(args.min_chunk_tokens),
+        "max_chunk_tokens": (None if args.max_chunk_tokens is None else int(args.max_chunk_tokens)),
+        "min_chunk_chars": int(args.min_chunk_chars),
+        "min_alpha_ratio": float(args.min_alpha_ratio),
+        "n_total_rows": int(n_total),
+        "n_kept_rows": 0,
+        "drop_too_few_tokens": 0,
+        "drop_too_many_tokens": 0,
+        "drop_too_short_chars": 0,
+        "drop_low_alpha_ratio": 0,
+        "drop_duplicate_text": 0,
+    }
+
+    global_row = 0
+    for p in parts:
+        with open(p["texts_path"], "r", encoding="utf-8") as fin:
+            for line in fin:
+                tok_count = int(token_counts[global_row])
+                if tok_count < args.min_chunk_tokens:
+                    stats["drop_too_few_tokens"] += 1
+                    global_row += 1
+                    continue
+                if args.max_chunk_tokens is not None and tok_count > args.max_chunk_tokens:
+                    stats["drop_too_many_tokens"] += 1
+                    global_row += 1
+                    continue
+
+                obj = json.loads(line)
+                text = (obj.get("text") or "").strip()
+                if len(text) < args.min_chunk_chars:
+                    stats["drop_too_short_chars"] += 1
+                    global_row += 1
+                    continue
+
+                toks = TOKEN_RE.findall(text)
+                if not toks:
+                    stats["drop_low_alpha_ratio"] += 1
+                    global_row += 1
+                    continue
+                alpha_ratio = sum(any(c.isalpha() for c in t) for t in toks) / float(len(toks))
+                if alpha_ratio < args.min_alpha_ratio:
+                    stats["drop_low_alpha_ratio"] += 1
+                    global_row += 1
+                    continue
+
+                if seen_hashes is not None:
+                    norm = normalized_text_for_dedupe(text)
+                    h = hashlib.sha1(norm.encode("utf-8")).hexdigest()
+                    if h in seen_hashes:
+                        stats["drop_duplicate_text"] += 1
+                        global_row += 1
+                        continue
+                    seen_hashes.add(h)
+
+                keep_mask[global_row] = True
+                stats["n_kept_rows"] += 1
+                global_row += 1
+
+    if global_row != n_total:
+        raise RuntimeError(f"Filter pass row mismatch: scanned {global_row:,} rows, expected {n_total:,}")
+
+    candidate_indices = np.flatnonzero(keep_mask).astype(np.int64)
+    return candidate_indices, stats
+
+
 def build_faiss_index_cpu_or_gpu(
     embeddings: np.ndarray,
     index_type: str,
@@ -444,10 +532,12 @@ def build_index_from_embedding_file(task: dict):
     return task["label"], time.time() - t0, task["gpu_id"], task["effective_nlist"], task["faiss_device"]
 
 
-def prepare_target_specs(args, total_tokens: int, n_total: int, token_counts: np.ndarray):
+def prepare_target_specs(args, total_tokens: int, candidate_indices: np.ndarray, token_counts: np.ndarray):
+    n_candidates = int(candidate_indices.shape[0])
+    candidate_token_counts = token_counts[candidate_indices].astype(np.int64)
     rng = np.random.default_rng(args.seed)
-    perm = rng.permutation(n_total)
-    perm_token_counts = token_counts[perm].astype(np.int64)
+    perm = rng.permutation(n_candidates)
+    perm_token_counts = candidate_token_counts[perm]
     cum_tokens = np.cumsum(perm_token_counts, dtype=np.int64)
 
     if args.token_targets_millions:
@@ -468,15 +558,15 @@ def prepare_target_specs(args, total_tokens: int, n_total: int, token_counts: np
     for td in target_defs:
         target_tokens = td["target_tokens"]
         if target_tokens >= total_tokens:
-            k = n_total
+            k = n_candidates
             capped_to_full = True
         else:
             k = int(np.searchsorted(cum_tokens, target_tokens, side="left")) + 1
             capped_to_full = False
 
-        selected = perm[:k]
-        selected_sorted = np.sort(selected)
-        actual_tokens = int(token_counts[selected].sum(dtype=np.int64))
+        selected_local = perm[:k]
+        selected_global_sorted = np.sort(candidate_indices[selected_local])
+        actual_tokens = int(token_counts[selected_global_sorted].sum(dtype=np.int64))
 
         out.append(
             {
@@ -485,7 +575,7 @@ def prepare_target_specs(args, total_tokens: int, n_total: int, token_counts: np
                 "target_tokens": int(target_tokens),
                 "actual_tokens": int(actual_tokens),
                 "n_vectors": int(k),
-                "selected_sorted": selected_sorted,
+                "selected_sorted": selected_global_sorted,
                 "capped_to_full": capped_to_full,
             }
         )
@@ -686,6 +776,21 @@ def main():
     ap.add_argument("--faiss_num_gpus", type=int, default=1, help="How many GPU IDs to use for parallel index builds.")
     ap.add_argument("--parallel_index_jobs", type=int, default=1, help="Parallel index build jobs.")
     ap.add_argument("--gpu_use_float16", action="store_true", help="Use float16 for GPU-cloned FAISS indices.")
+    ap.add_argument(
+        "--enable_store_filter",
+        action="store_true",
+        help="Apply optional quality filtering and dedupe before selecting ratioed targets.",
+    )
+    ap.add_argument("--dedupe_exact_text", action="store_true", help="Drop duplicate normalized chunk text.")
+    ap.add_argument("--min_chunk_tokens", type=int, default=20, help="Minimum chunk token count to keep.")
+    ap.add_argument("--max_chunk_tokens", type=int, default=None, help="Optional maximum chunk token count to keep.")
+    ap.add_argument("--min_chunk_chars", type=int, default=80, help="Minimum raw text character length to keep.")
+    ap.add_argument(
+        "--min_alpha_ratio",
+        type=float,
+        default=0.6,
+        help="Minimum fraction of alphanumeric tokens that contain at least one alphabetic character.",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out_root, exist_ok=True)
@@ -721,8 +826,33 @@ def main():
     total_tokens = int(token_counts.sum(dtype=np.int64))
     print(f"Total source tokens (approx via {args.encoding}): {total_tokens:,}", flush=True)
 
-    targets = prepare_target_specs(args, total_tokens, n_total, token_counts)
+    if args.enable_store_filter:
+        print("\n=== Applying optional store filter ===", flush=True)
+        print(
+            f"  dedupe_exact_text={args.dedupe_exact_text} "
+            f"min_chunk_tokens={args.min_chunk_tokens} max_chunk_tokens={args.max_chunk_tokens} "
+            f"min_chunk_chars={args.min_chunk_chars} min_alpha_ratio={args.min_alpha_ratio}",
+            flush=True,
+        )
+        candidate_indices, filter_stats = build_filtered_candidate_indices(parts, token_counts, args)
+        if candidate_indices.size == 0:
+            raise RuntimeError("Store filter removed all rows. Relax filter thresholds.")
+        filtered_tokens = int(token_counts[candidate_indices].sum(dtype=np.int64))
+        print(
+            f"Filter kept {candidate_indices.size:,}/{n_total:,} rows "
+            f"({100.0 * candidate_indices.size / max(1, n_total):.2f}%), "
+            f"tokens {filtered_tokens:,}/{total_tokens:,}",
+            flush=True,
+        )
+    else:
+        candidate_indices = np.arange(n_total, dtype=np.int64)
+        filter_stats = {"enabled": False}
+        filtered_tokens = total_tokens
+
+    targets = prepare_target_specs(args, filtered_tokens, candidate_indices, token_counts)
     for t in targets:
+        if args.enable_store_filter:
+            t["label"] = f"{t['label']}_filtered"
         t["out_dir"] = os.path.join(args.out_root, t["label"])
         os.makedirs(t["out_dir"], exist_ok=True)
         t["emb_done_marker"] = os.path.join(t["out_dir"], ".embeddings.done")
@@ -739,13 +869,13 @@ def main():
         print(
             f"\n=== Planned {t['label']} ===\n"
             f"Target tokens: {t['target_tokens']:,}\n"
-            f"Selected chunks: {t['n_vectors']:,}/{n_total:,}\n"
+            f"Selected chunks: {t['n_vectors']:,}/{candidate_indices.size:,}\n"
             f"Actual tokens: {t['actual_tokens']:,}",
             flush=True,
         )
         if t["capped_to_full"]:
             print(
-                f"WARNING: Requested target {t['target_tokens']:,} exceeds available {total_tokens:,}. Using full dataset.",
+                f"WARNING: Requested target {t['target_tokens']:,} exceeds available {filtered_tokens:,}. Using full dataset.",
                 flush=True,
             )
 
@@ -867,7 +997,9 @@ def main():
             "target_tokens": int(t["target_tokens"]),
             "actual_tokens": int(t["actual_tokens"]),
             "source_total_tokens": int(total_tokens),
+            "filtered_total_tokens": int(filtered_tokens),
             "source_total_vectors": int(n_total),
+            "candidate_total_vectors": int(candidate_indices.size),
             "n_vectors": int(t["n_vectors"]),
             "dim": int(dim),
             "seed": int(args.seed),
@@ -889,6 +1021,7 @@ def main():
             "faiss_device": dev_used,
             "faiss_gpu_id": int(gpu_id) if gpu_id is not None and dev_used == "gpu" else None,
             "index_build_sec": float(secs),
+            "store_filter": filter_stats,
         }
         with open(os.path.join(t["out_dir"], "stats.yaml"), "w", encoding="utf-8") as f:
             yaml.safe_dump(stats, f, sort_keys=False)
