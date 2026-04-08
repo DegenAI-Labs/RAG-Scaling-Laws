@@ -126,7 +126,7 @@ This script:
 - generates retrieval JSONL files for each index/task
 - runs baseline and RAG evaluation for each model scale
 
-### Scaling-law fitting
+### Scaling-Law Fitting
 
 ```bash
 python3 scripts/fit_scaling_law/fit_scaling_law.py \
