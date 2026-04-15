@@ -1,6 +1,6 @@
 # To Memorize or to Retrieve: Scaling Laws for RAG-Considerate Pretraining
 
-[Karan Singh](https://karanps.com), Michael Yu, [Varun Gangal](https://vgtomahawk.github.io), Zhuofu Tao, [Sachin Kumar](https://sites.google.com/view/sachinkumar?pli=1), [Emmy Liu](https://nightingal3.github.io), [Steven Y. Feng](https://styfeng.github.io)
+[Karan Singh](https://karanps.com), [Michael Yu](https://michaelc-yu.github.io/), [Varun Gangal](https://vgtomahawk.github.io), Zhuofu Tao, [Sachin Kumar](https://sites.google.com/view/sachinkumar?pli=1), [Emmy Liu](https://nightingal3.github.io), [Steven Y. Feng](https://styfeng.github.io)
 
 **Stanford University, Patronus AI, The Ohio State University, Carnegie Mellon University, and DegenAI Labs**
 
